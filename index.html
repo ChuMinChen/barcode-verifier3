@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>倉儲管理系統 - 雙軌修正版</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <style>
+        :root { --primary: #2196F3; --success: #4CAF50; --danger: #f44336; --bg: #f8f9fa; }
+        body { font-family: sans-serif; background: var(--bg); margin: 0; padding: 10px; }
+        .card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 12px; }
+        h2 { margin: 0 0 10px 0; color: var(--primary); font-size: 1.1rem; }
+        .task-item { border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; background: #fff; }
+        .source-tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #eee; color: #666; }
+        #reader { width: 100%; border-radius: 8px; overflow: hidden; background: #000; }
+        .item-row { display: flex; justify-content: space-between; padding: 12px; border-bottom: 1px solid #eee; border-left: 5px solid #ccc; }
+        .item-row.completed { border-left-color: var(--success); background: #f1f8e9; }
+        .btn { padding: 12px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; font-size: 15px; margin-top: 5px; }
+        .btn-blue { background: var(--primary); color: white; }
+        .btn-green { background: var(--success); color: white; }
+        .overlay { display: none; position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(244,67,54,0.95); z-index:10000; color:white; flex-direction:column; justify-content:center; align-items:center; text-align:center; }
+        input[type="text"] { width: 100%; padding: 12px; margin-top: 10px; border: 2px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+    </style>
+</head>
+<body>
+
+    <div id="taskSection">
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>📋 雲端任務清單</h2>
+                <button onclick="fetchCloudTasks()" style="border:1px solid var(--primary); background:none; color:var(--primary); padding:5px 10px; border-radius:5px;">🔄 雲端同步</button>
+            </div>
+            <div id="syncStatus" style="font-size: 12px; color: #888; margin: 5px 0;">連線狀態：待機</div>
+            <div id="taskList"></div>
+        </div>
+
+        <div class="card">
+            <h2>📁 手動導入 Excel</h2>
+            <input type="file" id="fileInput" accept=".xlsx, .xls, .csv">
+            <p style="font-size: 12px; color: #999; margin-top: 8px;">如果雲端無法同步，請選擇本地 Excel 檔案。</p>
+        </div>
+    </div>
+
+    <div id="workArea" style="display: none;">
+        <div class="card">
+            <button onclick="backToTasks()" style="background:none; border:none; color:#666; margin-bottom:10px; cursor:pointer;">⬅ 返回任務清單</button>
+            <h3 id="activeOrderTitle" style="margin:0;">單號：---</h3>
+            <div id="reader" style="margin-top:10px;"></div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+                <button class="btn btn-blue" onclick="startCamera()">📷 開啟相機</button>
+                <button class="btn" style="background:#555; color:white;" onclick="stopCamera()">關閉相機</button>
+            </div>
+            <input type="text" id="scanInput" placeholder="或使用 PDA 掃描槍輸入...">
+        </div>
+
+        <div class="card">
+            <div id="itemList"></div>
+            <button class="btn btn-green" onclick="uploadToCloud()" style="margin-top:20px;">☁️ 回傳結果至雲端</button>
+        </div>
+    </div>
+
+    <div id="errorOverlay" class="overlay" onclick="this.style.display='none'">
+        <h1 style="font-size:60px;">❌</h1>
+        <h2 id="errorMsg">條碼錯誤</h2>
+        <p>點擊螢幕關閉</p>
+    </div>
+
+    <audio id="sndOk" src="https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3"></audio>
+    <audio id="sndError" src="https://assets.mixkit.co/active_storage/sfx/2573/2573-preview.mp3"></audio>
+
+    <script>
+        const CLOUD_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQEuF4JQd8X9LuwADhI90Uj2_xlu9qROMPBPUNJGKM3RxprWX_4vVYAlhXWdLSZlXgOJhpm4ozv1_eG/pub?output=csv";
+        const REPORT_API = "https://script.google.com/macros/s/AKfycbwxGXUGExSlSV3g_Wo73BtFSfqkZD4sCQRgGTq7R8X_9S4N1BISJK1K2jZLsiTsNV_V/exec";
+
+        let allOrders = {}; 
+        let currentOrderId = "";
+        let html5QrCode;
+
+        // --- 1. 雲端同步邏輯 ---
+        async function fetchCloudTasks() {
+            const status = document.getElementById('syncStatus');
+            try {
+                status.innerText = "連線中...";
+                const res = await fetch(CLOUD_URL + "&t=" + new Date().getTime());
+                const csv = await res.text();
+                const wb = XLSX.read(csv, { type: 'string' });
+                const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+                
+                // 清除舊的雲端標記資料
+                Object.keys(allOrders).forEach(k => { if(allOrders[k][0].source === "雲端") delete allOrders[k]; });
+                processJson(json, "雲端");
+                status.innerText = "✅ 同步成功：" + new Date().toLocaleTimeString();
+            } catch (e) {
+                status.innerText = "❌ 雲端同步失敗";
+            }
+        }
+
+        // --- 2. 手動 Excel 導入邏輯 (修正版) ---
+        document.getElementById('fileInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const data = new Uint8Array(evt.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                    const json = XLSX.utils.sheet_to_json(firstSheet);
+                    
+                    if (json.length === 0) throw new Error("Excel 內容為空");
+                    
+                    // 檢查關鍵欄位是否存在
+                    if (!json[0].hasOwnProperty('條碼') || !json[0].hasOwnProperty('應出數量')) {
+                        alert("Excel 格式不正確！必須包含『訂單編號』、『條碼』、『品項名稱』、『應出數量』。");
+                        return;
+                    }
+
+                    processJson(json, "手動匯入");
+                    alert("成功手動匯入 " + json.length + " 筆產品資料！");
+                    e.target.value = ""; // 清空上傳，允許重複上傳
+                } catch (err) {
+                    alert("讀取 Excel 失敗: " + err.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        // 統一資料處理核心
+        function processJson(json, source) {
+            json.forEach(row => {
+                const id = String(row['訂單編號'] || "手動單-" + source).trim();
+                if (!allOrders[id]) allOrders[id] = [];
+                
+                // 檢查是否已存在該條碼於該單中（避免重複導入）
+                const exists = allOrders[id].some(i => i.barcode === String(row['條碼']).trim());
+                if(!exists) {
+                    allOrders[id].push({
+                        barcode: String(row['條碼'] || "").trim(),
+                        name: row['品項名稱'] || "未知商品",
+                        target: parseInt(row['應出數量'] || 0),
+                        current: 0,
+                        source: source
+                    });
+                }
+            });
+            renderTaskList();
+        }
+
+        function renderTaskList() {
+            const list = document.getElementById('taskList');
+            list.innerHTML = '';
+            const ids = Object.keys(allOrders);
+            if (ids.length === 0) list.innerHTML = "<p style='color:#999;'>目前無任何任務...</p>";
+            
+            ids.forEach(id => {
+                const div = document.createElement('div');
+                div.className = 'task-item';
+                div.innerHTML = `
+                    <div><strong>${id}</strong><br><small>${allOrders[id].length} 個品項</small></div>
+                    <span class="source-tag">${allOrders[id][0].source}</span>
+                `;
+                div.onclick = () => openWork(id);
+                list.appendChild(div);
+            });
+        }
+
+        function openWork(id) {
+            currentOrderId = id;
+            document.getElementById('taskSection').style.display = 'none';
+            document.getElementById('workArea').style.display = 'block';
+            document.getElementById('activeOrderTitle').innerText = `單號：${id}`;
+            renderItems();
+        }
+
+        function backToTasks() {
+            document.getElementById('taskSection').style.display = 'block';
+            document.getElementById('workArea').style.display = 'none';
+            if(html5QrCode) stopCamera();
+        }
+
+        function renderItems() {
+            const list = document.getElementById('itemList');
+            list.innerHTML = '';
+            allOrders[currentOrderId].forEach(i => {
+                const done = i.current >= i.target;
+                const row = document.createElement('div');
+                row.className = `item-row ${done ? 'completed' : ''}`;
+                row.innerHTML = `<div><b>${i.name}</b><br><small>${i.barcode}</small></div>
+                                 <div><b>${i.current} / ${i.target}</b></div>`;
+                list.appendChild(row);
+            });
+        }
+
+        function handleBarcode(code) {
+            const items = allOrders[currentOrderId];
+            const item = items.find(i => i.barcode === code);
+            if (item) {
+                if (item.current < item.target) {
+                    item.current++;
+                    document.getElementById('sndOk').play();
+                    renderItems();
+                } else { showError("數量已達上限"); }
+            } else { showError("此單無此條碼：" + code); }
+        }
+
+        // --- 回傳與輔助 ---
+        async function uploadToCloud() {
+            const data = allOrders[currentOrderId].map(i => ({
+                orderId: currentOrderId, barcode: i.barcode, name: i.name, target: i.target, current: i.current
+            }));
+            if (!confirm("確定要將掃描結果回傳至雲端？")) return;
+            try {
+                await fetch(REPORT_API, { method: 'POST', mode: 'no-cors', body: JSON.stringify(data) });
+                alert("✅ 已送出請求，請檢查『出貨紀錄』分頁。");
+            } catch (e) { alert("❌ 上傳失敗"); }
+        }
+
+        function startCamera() {
+            if (!html5QrCode) html5QrCode = new Html5Qrcode("reader");
+            html5QrCode.start({ facingMode: "environment" }, { fps: 20, qrbox: { width: 300, height: 150 } }, handleBarcode);
+        }
+        function stopCamera() { if(html5QrCode) html5QrCode.stop(); }
+        function showError(m) { document.getElementById('sndError').play(); document.getElementById('errorMsg').innerText = m; document.getElementById('errorOverlay').style.display = 'flex'; }
+        function resetSystem() { if(confirm("確定重置系統？")) { allOrders = {}; renderTaskList(); } }
+
+        document.getElementById('scanInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { handleBarcode(e.target.value.trim()); e.target.value = ''; }
+        });
+
+        window.onload = fetchCloudTasks;
+    </script>
+</body>
+</html>
